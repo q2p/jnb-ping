@@ -205,4 +205,3 @@ nexusPublishing {
          snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
       }
    }
-}

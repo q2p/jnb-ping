@@ -105,7 +105,12 @@ class PingTarget : Comparable<PingTarget> {
       complete = false
    }
 
-    override fun compareTo(other: PingTarget): Int = timeoutNs.compareTo(other.timeoutNs)
+    override fun compareTo(other: PingTarget): Int {
+       val timeoutDelta = timeoutNs.compareTo(other.timeoutNs)
+       if (timeoutDelta != 0)
+          return timeoutDelta
+       return sequence.compareTo(other.sequence)
+    }
 
    override fun toString(): String = inetAddress.toString()
 }
@@ -210,7 +215,7 @@ class IcmpPinger(private val responseHandler:PingResponseHandler) {
       pendingPings.offer(PingTarget(pingTarget))
       // Declining must happen after insertion to avoid a race condition
       if (!running.get()) {
-         declinePending(pendingPings, FailureReason.SelectorStopped)
+         declinePings(pendingPings, FailureReason.SelectorStopped)
       } else if (awoken.compareAndSet(false, true)) {
          wakeup()
       }
@@ -251,19 +256,16 @@ class IcmpPinger(private val responseHandler:PingResponseHandler) {
             }
 
             if (rc > 0) {
-               val revents4 = fd4.revents // memoize for performance
-               val revents6 = fd6.revents // memoize for performance
-
-               if (revents4 and POLLERR != 0 || revents6 and POLLERR != 0) {
+               if (fd4.revents and POLLERR != 0 || fd6.revents and POLLERR != 0) {
                   LOGGER.severe("poll() created a POLLERR event")
                   break
                }
 
-               if (fd4.fd > 0 && revents4 and POLLIN_OR_PRI != 0) processReceives(fd4.fd, true)
-               if (fd6.fd > 0 && revents6 and POLLIN_OR_PRI != 0) processReceives(fd6.fd, false)
+               if (fd4.fd > 0 && fd4.revents and POLLIN_OR_PRI != 0) processReceives(fd4.fd, true)
+               if (fd6.fd > 0 && fd6.revents and POLLIN_OR_PRI != 0) processReceives(fd6.fd, false)
 
-               if (wokeUp || revents4 and POLLOUT != 0) processSends(pending4Pings, waitingTargets4, fd4, isIPv4 = true)
-               if (wokeUp || revents6 and POLLOUT != 0) processSends(pending6Pings, waitingTargets6, fd6, isIPv4 = false)
+               if (wokeUp || fd4.revents and POLLOUT != 0) processSends(pending4Pings, waitingTargets4, fd4, true)
+               if (wokeUp || fd6.revents and POLLOUT != 0) processSends(pending6Pings, waitingTargets6, fd6, false)
 
                fdPipe.revents = 0
                fd4.revents = 0
@@ -272,7 +274,11 @@ class IcmpPinger(private val responseHandler:PingResponseHandler) {
 
             val next4TimeoutMs = processTimeouts(waitingTargets4)
             val next6TimeoutMs = processTimeouts(waitingTargets6)
-            pollTimeoutMs = minOf(next4TimeoutMs, next6TimeoutMs)
+            if (next4TimeoutMs != null && next6TimeoutMs != null) {
+               pollTimeoutMs = minOf(next4TimeoutMs, next6TimeoutMs)
+            } else {
+               pollTimeoutMs = next4TimeoutMs ?: next6TimeoutMs ?: infinite
+            }
 
             LOGGER.fine(::logPendingPingsAndActors)
 
@@ -304,11 +310,11 @@ class IcmpPinger(private val responseHandler:PingResponseHandler) {
             pipefd[1] = -1
          }
 
-         declinePending(pending4Pings, FailureReason.SelectorStopped)
-         declinePending(pending6Pings, FailureReason.SelectorStopped)
+         declinePings(pending4Pings, FailureReason.SelectorStopped)
+         declinePings(pending6Pings, FailureReason.SelectorStopped)
 
-         declineInflight(waitingTargets4)
-         declineInflight(waitingTargets6)
+         declinePings(waitingTargets4, FailureReason.SelectorStopped)
+         declinePings(waitingTargets6, FailureReason.SelectorStopped)
       }
    }
 
@@ -324,6 +330,7 @@ class IcmpPinger(private val responseHandler:PingResponseHandler) {
     *                                     Private Methods
     */
 
+
    private fun processSends(pendingPings: LinkedBlockingQueue<PingTarget>, waitingTargets: WaitingTargetCollection, fd: PollFd, isIPv4: Boolean) {
       if (pendingPings.isEmpty()) return
 
@@ -336,7 +343,7 @@ class IcmpPinger(private val responseHandler:PingResponseHandler) {
                LOGGER.warning("Unable to create IPv6 socket. If this is Linux, you might need to set sysctl net.ipv6.ping_group_range")
             }
 
-            declinePending(pendingPings, FailureReason.UnableToCreateSocket)
+            declinePings(pendingPings, FailureReason.UnableToCreateSocket)
             return
          }
       }
@@ -351,41 +358,41 @@ class IcmpPinger(private val responseHandler:PingResponseHandler) {
       }
    }
 
-   private fun processReceives(fd: FD, isIPv4: Boolean) {
-      do {
-         val more = recvIcmp(fd, isIPv4) // read and lookup actor id in map
-      } while (more)
-   }
-
-   private fun processTimeouts(targets: WaitingTargetCollection) : Int {
-      while (true) {
-         val timeoutNs = targets.peekTimeoutQueue() ?: return Int.MAX_VALUE
-         val nowNs = nanoTime()
-         val remainingMs = NANOSECONDS.toMillis(timeoutNs - nowNs).toInt() // NOTE: would roll over if timeout is longer than 35 minutes
-         if (remainingMs > 0) {
-            return minOf(remainingMs, Int.MAX_VALUE)
-         }
-
-         try {
-           responseHandler.onFailure(targets.take(), FailureReason.TimedOut)
-         } catch (_:Exception) {}
-     }
-   }
-
-   private fun declinePending(pendingPings: LinkedBlockingQueue<PingTarget>, failureReason: FailureReason) {
+   private fun declinePings(pendingPings: LinkedBlockingQueue<PingTarget>, failureReason: FailureReason) {
       while (true) {
          // Taking atomically to avoid race conditions
-         val pendingPing = pendingPings.poll() ?: break
+         val pendingPing = pendingPings.poll() ?: return
          try {
             responseHandler.onFailure(pendingPing, failureReason)
          } catch (_:Exception) {}
       }
    }
 
-   private fun declineInflight(waitingTargets: WaitingTargetCollection) {
-      waitingTargets.drain().forEach { target ->
+   private fun declinePings(waitingTargets: WaitingTargetCollection, failureReason: FailureReason) {
+      while(waitingTargets.isNotEmpty()) {
          try {
-            responseHandler.onFailure(target, FailureReason.SelectorStopped)
+            responseHandler.onFailure(waitingTargets.take(), failureReason)
+         } catch (_:Exception) {}
+      }
+   }
+
+   private fun processReceives(fd: FD, isIPv4: Boolean) {
+      do {
+         val more = recvIcmp(fd, isIPv4) // read and lookup actor id in map
+      } while (more)
+   }
+
+   private fun processTimeouts(targets: WaitingTargetCollection) : Int? {
+      while (true) {
+         val timeoutNs = targets.peekTimeoutQueue() ?: return null
+         val nowNs = nanoTime()
+         val remainingMs = NANOSECONDS.toMillis(timeoutNs - nowNs)
+         if (remainingMs > 0) {
+            return minOf(remainingMs, Int.MAX_VALUE.toLong()).toInt()
+         }
+
+         try {
+            responseHandler.onFailure(targets.take(), FailureReason.TimedOut)
          } catch (_:Exception) {}
       }
    }
